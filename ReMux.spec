@@ -21,7 +21,17 @@ if MACOS:
         icon="assets/icon.icns",
         bundle_identifier="com.daverage.remux",
         version=VERSION,
-        info_plist={"NSHighResolutionCapable": True, "LSMinimumSystemVersion": "11.0"},
+        info_plist={
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": "11.0",
+            # Lets videos and audio be dropped on the Dock icon or opened with ReMux, without making it the default.
+            "CFBundleDocumentTypes": [{
+                "CFBundleTypeName": "Video or audio",
+                "CFBundleTypeRole": "Viewer",
+                "LSHandlerRank": "Alternate",
+                "LSItemContentTypes": ["public.movie", "public.audio"],
+            }],
+        },
     )
 else:
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, name="ReMux", console=False, icon="assets/icon.ico")
