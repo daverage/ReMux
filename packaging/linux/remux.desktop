@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ReMux
+Comment=Replace a video's audio track and convert between formats
+Exec=ReMux
+Icon=remux
+Categories=AudioVideo;Video;
+Terminal=false

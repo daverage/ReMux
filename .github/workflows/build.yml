@@ -1,0 +1,131 @@
+name: Build app
+
+# Builds ReMux for macOS, Windows and Linux on every push and pull request.
+# Version tags (for example v1.0.0) also publish a GitHub Release.
+#
+#   macOS arm64: .dmg
+#   Windows x64: single-file .exe
+#   Linux x64:   .AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-14
+            asset: ReMux-macOS-arm64.dmg
+          - name: Windows x64
+            os: windows-latest
+            asset: ReMux-Windows-x64.exe
+          - name: Linux x64
+            os: ubuntu-22.04 # oldest supported glibc keeps the AppImage widely compatible
+            asset: ReMux-Linux-x86_64.AppImage
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller==6.17.0
+
+      - name: Build
+        run: python -m PyInstaller ReMux.spec --noconfirm
+
+      # Launching proves the bundle starts (no missing libraries). Without ffmpeg on the
+      # runner the app waits on its "ffmpeg not found" dialog, so still running = success.
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dist/ReMux.app/Contents/MacOS/ReMux & pid=$!
+          sleep 15
+          kill -0 "$pid" && kill "$pid"
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          status=0
+          timeout 15 xvfb-run -a dist/ReMux || status=$?
+          test "$status" -eq 124 # 124 = still running when the timeout hit
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $app = Start-Process dist/ReMux.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($app.HasExited) { throw "ReMux exited with code $($app.ExitCode)" }
+          Stop-Process -Id $app.Id
+
+      - name: Package DMG
+        if: runner.os == 'macOS'
+        run: |
+          mkdir dmg
+          cp -R dist/ReMux.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname ReMux -srcfolder dmg -format UDZO "${{ matrix.asset }}"
+          hdiutil verify "${{ matrix.asset }}"
+
+      - name: Package EXE
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp dist/ReMux.exe "${{ matrix.asset }}"
+
+      - name: Package AppImage
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          ARCH: x86_64
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp dist/ReMux AppDir/usr/bin/
+          ln -s usr/bin/ReMux AppDir/AppRun
+          cp packaging/linux/remux.desktop AppDir/
+          cp assets/icon.png AppDir/remux.png
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ./appimagetool AppDir "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # Assets keep fixed names, so https://github.com/<repo>/releases/latest/download/<asset>
+  # links in the README work for every release.
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*
