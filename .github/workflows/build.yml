@@ -42,8 +42,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PyInstaller
-        run: python -m pip install pyinstaller==6.17.0
+      - name: Install PyInstaller and drag-and-drop support
+        run: python -m pip install pyinstaller==6.17.0 tkinterdnd2==0.6.3
 
       - name: Build
         run: python -m PyInstaller ReMux.spec --noconfirm

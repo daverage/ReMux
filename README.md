@@ -7,7 +7,7 @@ A small desktop app that puts a new audio track on a video, and optionally conve
 - **Hardware encoding:** VideoToolbox (Mac), NVENC (NVIDIA), Quick Sync (Intel) and AMF (AMD) are offered when this computer actually supports them.
 - **Show the result:** when it finishes, one click opens the output in Finder / Explorer / your file manager.
 
-The output is saved next to the video as `<name>_remux.<ext>`.
+The output is saved next to the video as `<name>_remux.<ext>`, or in a folder you choose. If that file already exists, ReMux asks whether to replace it or keep both (saving `<name>_remux 2.<ext>`).
 
 ## Download
 
@@ -29,7 +29,7 @@ ReMux uses [ffmpeg](https://ffmpeg.org), which is installed separately. If it's 
 
 ## Run from source
 
-Needs Python 3.9+ with Tkinter (on Debian/Ubuntu: `sudo apt install python3-tk`).
+Needs Python 3.9+ with Tkinter (on Debian/Ubuntu: `sudo apt install python3-tk`). To drag files into the window, also install `python3 -m pip install tkinterdnd2`; without it, use the buttons or the File menu.
 
 ```sh
 python3 remux.py
@@ -38,7 +38,7 @@ python3 remux.py
 ## Build
 
 ```sh
-python3 -m pip install pyinstaller
+python3 -m pip install pyinstaller tkinterdnd2
 python3 -m PyInstaller ReMux.spec --noconfirm
 ```
 
