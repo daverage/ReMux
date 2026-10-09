@@ -667,6 +667,9 @@ class ReMuxApp(tk.Tk):
             self._set_audio(path)
 
     def _set_audio(self, path):
+        if path == self.video_path.get():
+            self.status_var.set(f"{os.path.basename(path)} is already the video. Choose a different audio file.")
+            return
         self.media.pop(path, None)
         self._remember("audio_dir", os.path.dirname(path))
         self.audio_path.set(path)
@@ -707,11 +710,21 @@ class ReMuxApp(tk.Tk):
         paths = [path for path in paths if os.path.isfile(path)]
         if not paths:
             return
+        kind = lambda path: os.path.splitext(path)[1].lstrip(".").lower()
+        name = os.path.basename(paths[0])
         if role == "video":
+            if kind(paths[0]) in AUDIO_EXTS:  # an audio file can't be the video; it was meant for Audio
+                self._set_audio(paths[0])
+                self.status_var.set(f"{name} is an audio file, so it's been used as the audio.")
+                return
             return self._set_video(paths[0])
         if role == "audio":
-            return self._set_audio(paths[0])
-        kind = lambda path: os.path.splitext(path)[1].lstrip(".").lower()
+            if paths[0] == self.video_path.get():
+                return self._set_audio(paths[0])  # refuses, and says why
+            self._set_audio(paths[0])
+            if kind(paths[0]) not in AUDIO_EXTS:  # a video here is allowed: its sound replaces the video's
+                self.status_var.set(f"Using the audio from {name}.")
+            return
         audio = [path for path in paths if kind(path) in AUDIO_EXTS]
         video = [path for path in paths if path not in audio]
         if video:
@@ -843,6 +856,9 @@ class ReMuxApp(tk.Tk):
         self.note_action = None
         container = self.container.get()
         video = self.media.get(self.video_path.get())
+        if video and not video.video:
+            notes.append(f"{os.path.basename(self.video_path.get())} has no video in it. "
+                         "Choose a video file, and put this one under Audio if it's the new sound.")
         if (video and video.video in VIDEO_FAMILIES and self.vcodec.get() == COPY
                 and video.video not in CONTAINERS[container][1]):
             ext = os.path.splitext(self.video_path.get())[1].lstrip(".").lower()
@@ -1015,6 +1031,11 @@ class ReMuxApp(tk.Tk):
         video, audio = self.video_path.get(), self.audio_path.get()
         if not video:
             messagebox.showwarning("Choose a video", "Choose the video you want to work on first.")
+            return
+        known = self.media.get(video)
+        if known and not known.video:
+            messagebox.showwarning("No video in this file", f"{os.path.basename(video)} has no video track.",
+                                   detail="Choose a video file. If this is the new sound, choose it under Audio.")
             return
         if audio and self.audio_info == (audio, None):
             messagebox.showwarning("No audio in this file", f"{os.path.basename(audio)} has no audio track.",
