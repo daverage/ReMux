@@ -33,7 +33,9 @@ ReMux puts a new audio track on a video and, optionally, converts the result to 
 ## Capabilities and Constraints
 
 - Containers: MP4, MOV, MKV, WebM, AVI, MPEG-TS. Codec choices are filtered to what each container accepts.
-- Video: copy, H.264, HEVC, AV1, VP9, ProRes 422 HQ (software and verified hardware variants). Audio: copy, AAC, MP3, Opus, Vorbis, FLAC, ALAC, PCM 24-bit, AC-3.
+- Video: copy, H.264, HEVC, AV1, VP9, ProRes 422 HQ. Menus name the codec only; a single "Use graphics hardware" switch picks the verified hardware encoder for it, so users never choose NVENC, Quick Sync and so on by name.
+- Size: Keep original / Smaller (HEVC 10-bit) / Smallest (AV1 10-bit), constant quality, or Fit a size I choose (HEVC at an average bitrate, two-pass in software, with a live quality rating and warnings). Lossless audio is converted to AAC when shrinking, already-compressed sources are warned about, and an output that isn't smaller is discarded.
+- Audio: copy, AAC, MP3, Opus, Vorbis, FLAC, ALAC, PCM 24-bit, AC-3.
 - Progress bar with cancel; overwrite confirmation; error output surfaced on failure; "Show in Finder/Explorer" after success.
 - Current stack: single-file Python 3.9+ / Tkinter + ttk (`remux.py`), packaged with PyInstaller (`ReMux.spec`), built and smoke-tested per OS in GitHub Actions.
 - UI framework is not locked: staying on stock Tkinter was not made a requirement, and a distinct custom look is acceptable. Any change must still build with PyInstaller on all three OSes.

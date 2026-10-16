@@ -54,7 +54,9 @@ EXT_TO_CONTAINER = {"m4v": "MP4", "mts": "MPEG-TS", "m2ts": "MPEG-TS"}
 EXT_TO_CONTAINER.update({ext: label for label, (ext, _) in CONTAINERS.items()})
 
 Encoder = namedtuple("Encoder", "label family name args")
-Media = namedtuple("Media", "duration video audio")
+# bpp: overall bits per pixel per frame; pixel_rate: pixels per second of video. channels and lossless describe
+# the first audio track; audio_kbps has each audio track's bitrate, or None where ffmpeg doesn't say.
+Media = namedtuple("Media", "duration video audio bpp channels lossless pixel_rate audio_kbps")
 
 # Constant-quality VideoToolbox encoding needs Apple Silicon; fall back to a bitrate elsewhere.
 VT = ["-q:v", "65"] if platform.machine() == "arm64" else ["-b:v", "12M"]
@@ -71,20 +73,25 @@ SOFTWARE_VIDEO = [
     Encoder("VP9", "vp9", "libvpx-vp9", ["-crf", "31", "-b:v", "0", "-row-mt", "1"]),
     Encoder("ProRes 422 HQ", "prores", "prores_ks", ["-profile:v", "hq"]),
 ]
+# Hardware encoders share the software ones' labels: the menus name the codec, and "Use graphics hardware"
+# decides which encoder makes it, so nobody needs to know what NVENC or Quick Sync is.
 HARDWARE_VIDEO = [
-    Encoder("H.264 (VideoToolbox)", "h264", "h264_videotoolbox", [*VT, *YUV420]),
-    Encoder("H.265 / HEVC (VideoToolbox)", "hevc", "hevc_videotoolbox", VT),
-    Encoder("ProRes 422 HQ (VideoToolbox)", "prores", "prores_videotoolbox", ["-profile:v", "hq"]),
-    Encoder("H.264 (NVENC)", "h264", "h264_nvenc", [*NVENC, *YUV420]),
-    Encoder("H.265 / HEVC (NVENC)", "hevc", "hevc_nvenc", NVENC),
-    Encoder("AV1 (NVENC)", "av1", "av1_nvenc", NVENC),
-    Encoder("H.264 (Quick Sync)", "h264", "h264_qsv", QSV),
-    Encoder("H.265 / HEVC (Quick Sync)", "hevc", "hevc_qsv", QSV),
-    Encoder("AV1 (Quick Sync)", "av1", "av1_qsv", QSV),
-    Encoder("H.264 (AMF)", "h264", "h264_amf", AMF),
-    Encoder("H.265 / HEVC (AMF)", "hevc", "hevc_amf", AMF),
-    Encoder("AV1 (AMF)", "av1", "av1_amf", AMF),
+    Encoder("H.264", "h264", "h264_videotoolbox", [*VT, *YUV420]),
+    Encoder("H.265 / HEVC", "hevc", "hevc_videotoolbox", VT),
+    Encoder("ProRes 422 HQ", "prores", "prores_videotoolbox", ["-profile:v", "hq"]),
+    Encoder("H.264", "h264", "h264_nvenc", [*NVENC, *YUV420]),
+    Encoder("H.265 / HEVC", "hevc", "hevc_nvenc", NVENC),
+    Encoder("AV1", "av1", "av1_nvenc", NVENC),
+    Encoder("H.264", "h264", "h264_qsv", QSV),
+    Encoder("H.265 / HEVC", "hevc", "hevc_qsv", QSV),
+    Encoder("AV1", "av1", "av1_qsv", QSV),
+    Encoder("H.264", "h264", "h264_amf", AMF),
+    Encoder("H.265 / HEVC", "hevc", "hevc_amf", AMF),
+    Encoder("AV1", "av1", "av1_amf", AMF),
 ]
+# What each kind of hardware is called in the window, by the encoder name's suffix.
+HARDWARE_NAMES = {"videotoolbox": "Apple's media engine", "nvenc": "the NVIDIA graphics card",
+                  "qsv": "Intel Quick Sync", "amf": "the AMD graphics card"}
 AUDIO = [
     Encoder("AAC", "aac", "aac", ["-b:a", "192k"]),
     Encoder("MP3", "mp3", "libmp3lame", ["-b:a", "192k"]),
@@ -97,13 +104,79 @@ AUDIO = [
 ]
 AUDIO_NAMES = {"pcm": "Uncompressed (PCM)", "aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis",
                "flac": "FLAC", "alac": "ALAC", "ac3": "AC-3"}
+# The stereo bitrates above spread too thin over 5.1 or 7.1, so surround audio gets these instead.
+SURROUND_BITRATE = {"aac": "448k", "opus": "320k"}
+
+# Making the file smaller means re-encoding the video at a constant quality with an efficient codec.
+# 10-bit output is used even for 8-bit sources, since it compresses better and avoids banding in skies and shadows.
+ORIGINAL_SIZE = "Keep original"
+SMALLER, SMALLEST = "Smaller (looks the same)", "Smallest (slightly softer)"
+SIZES = [
+    Encoder(SMALLER, "hevc", "libx265",
+            ["-crf", "21", "-preset", "medium", "-pix_fmt", "yuv420p10le",
+             "-x265-params", "aq-mode=3:log-level=error"]),  # aq-mode 3 spends more on dark scenes
+    # film-grain removes the grain and recreates it on playback; grain is what costs the most to keep exactly.
+    Encoder(SMALLEST, "av1", "libsvtav1",
+            ["-crf", "30", "-preset", "6", "-pix_fmt", "yuv420p10le", "-svtav1-params", "tune=0:film-grain=8"]),
+]
+# The hardware versions are several times faster but need more bits for the same picture, so their quality
+# targets sit a little higher and the files come out larger. VideoToolbox has no AV1 encoder, and needs Apple
+# Silicon for constant quality; AMD's AV1 quality scale differs by driver, so it's left to the software encoder.
+TEN_BIT = ["-pix_fmt", "p010le"]
+NVENC_SIZE = ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-b:v", "0", "-spatial-aq", "1", *TEN_BIT]
+HARDWARE_SIZES = [
+    *([Encoder(SMALLER, "hevc", "hevc_videotoolbox", ["-q:v", "58", "-profile:v", "main10", *TEN_BIT])]
+      if platform.machine() == "arm64" else []),
+    Encoder(SMALLER, "hevc", "hevc_nvenc", ["-cq", "24", "-profile:v", "main10", *NVENC_SIZE]),
+    Encoder(SMALLEST, "av1", "av1_nvenc", ["-cq", "32", *NVENC_SIZE]),
+    Encoder(SMALLER, "hevc", "hevc_qsv", ["-global_quality", "24", "-preset", "slower", "-profile:v", "main10",
+                                          *TEN_BIT]),
+    Encoder(SMALLEST, "av1", "av1_qsv", ["-global_quality", "30", "-preset", "slower", *TEN_BIT]),
+    Encoder(SMALLER, "hevc", "hevc_amf", ["-quality", "quality", "-rc", "cqp", "-qp_i", "24", "-qp_p", "26",
+                                          "-profile:v", "main10", *TEN_BIT]),
+]
+SIZE_NOTES = {
+    "hevc": "Smaller re-encodes the video as HEVC. Most people won't see a difference, though very fine grain and "
+            "dark gradients can come out a little softer.",
+    "av1": "Smallest re-encodes the video as AV1, the most compact format. Fine detail is slightly softened, and "
+           "film grain is recreated rather than kept exactly. Older TVs, phones and computers may not play it.",
+}
+SLOW_NOTE = " It's slow: expect it to take about as long as the video plays, or longer."
+# Below this many bits per pixel per frame, a video is already tightly compressed (a 1080p film at about 4 Mbps),
+# so re-encoding gains little and costs detail.
+TIGHT_BPP = 0.08
+EFFICIENT_VIDEO = {"hevc", "av1", "vp9"}
+LARGE_AUDIO = {"truehd", "mlp", "flac", "alac"}  # lossless, plus pcm_* and DTS-HD MA, checked in media_info
+# Keep the new file only if it saves at least this much of the original's size.
+WORTH_KEEPING = 0.95
+
+# Fitting a size gives the encoder an average bitrate, worked out from the size wanted, instead of a quality.
+# It uses the Smaller encoders (HEVC), so it plays wherever Smaller does.
+FIT_SIZE = "Fit a size I choose…"
+OVERHEAD = 0.985  # MP4 and MKV use about 1.5% of the file for their own bookkeeping
+FIT_MIN_KBPS = 100  # below this there's no picture worth having
+TWO_PASS = {"libx265"}  # software encoders read the whole video once first, to share the bits out well
+X265_STATS = "remux-x265.log"  # written in a folder of its own: x265's options can't hold a full path
+# How the picture's bitrate is described, by HEVC bits per pixel per frame, adjusted for resolution (below).
+# A 1080p film at 24 fps gets "Very good" from about 3 Mbps and "Poor" under 1 Mbps.
+FIT_QUALITY = [
+    (0.10, "Excellent: it should look the same as the original."),
+    (0.06, "Very good: hard to tell apart from the original on most screens."),
+    (0.035, "Good: fine detail and film grain are softened, but it looks clean on phones, laptops and most TVs."),
+    (0.02, "Fair: noticeably soft, with some blocking in dark or fast-moving scenes."),
+    (0, "Poor: blurry and blocky, especially in dark or fast-moving scenes. Choose a bigger size if you can."),
+]
+FIT_POOR = 0.02  # below this, ask before starting
+# Bigger pictures need fewer bits per pixel for the same look, so the measure is scaled against 1080p at 24 fps.
+REF_PIXEL_RATE = 1920 * 1080 * 24
+HARDWARE_EFFICIENCY = 0.75  # hardware encoders get roughly this much picture from the same bits
 LOSSLESS = {"pcm", "flac", "alac"}
 VIDEO_FAMILIES = {"h264", "hevc", "av1", "vp9", "prores"}  # ffmpeg names that match the CONTAINERS families
 VIDEO_NAMES = {"h264": "H.264", "hevc": "HEVC", "av1": "AV1", "vp9": "VP9", "vp8": "VP8", "prores": "ProRes",
                "mpeg4": "MPEG-4", "mpeg2video": "MPEG-2", "dvvideo": "DV", "mjpeg": "Motion JPEG"}
 # What to convert audio to when it can't be copied into a format, best first. MKV holds anything.
 FALLBACK_AUDIO = {"MP4": ["aac"], "MOV": ["aac"], "WebM": ["opus", "vorbis"], "AVI": ["mp3", "ac3"],
-                  "MPEG-TS": ["aac", "mp3"]}
+                  "MPEG-TS": ["aac", "mp3"], "MKV": ["aac"]}  # MKV is only used when making a file smaller
 CONFIRM_CANCEL_AFTER = 10  # seconds; shorter jobs stop without asking
 
 # Apps launched from the desktop get a minimal PATH, so also look where package managers install.
@@ -162,9 +235,70 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW, **kwargs)
 
 
+def is_hardware(enc):
+    return enc.name.rsplit("_", 1)[-1] in HARDWARE_NAMES
+
+
+def by_label(encoders):
+    """label -> (software, hardware) encoders for it, either possibly None. The first of each kind wins."""
+    table = {}
+    for enc in encoders:
+        software, hardware = table.get(enc.label, (None, None))
+        if is_hardware(enc):
+            hardware = hardware or enc
+        else:
+            software = software or enc
+        table[enc.label] = (software, hardware)
+    return table
+
+
+def fit_encoder(enc, kbps, pass_=None):
+    """The Smaller encoder, set to an average bitrate that lands on a file size rather than to a quality."""
+    rate, peak, buffer = f"{kbps}k", f"{kbps * 3 // 2}k", f"{kbps * 2}k"
+    stats = f":pass={pass_}:stats={X265_STATS}" if pass_ else ""
+    args = {
+        "libx265": ["-b:v", rate, "-preset", "medium", "-pix_fmt", "yuv420p10le",
+                    "-x265-params", f"aq-mode=3:log-level=error{stats}"],
+        "hevc_videotoolbox": ["-b:v", rate, "-profile:v", "main10", *TEN_BIT],
+        "hevc_nvenc": ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-b:v", rate, "-maxrate", peak,
+                       "-bufsize", buffer, "-multipass", "fullres", "-spatial-aq", "1", "-profile:v", "main10",
+                       *TEN_BIT],
+        "hevc_qsv": ["-b:v", rate, "-maxrate", peak, "-bufsize", buffer, "-preset", "slower", "-profile:v", "main10",
+                     *TEN_BIT],
+        "hevc_amf": ["-quality", "quality", "-rc", "vbr_peak", "-b:v", rate, "-maxrate", peak,
+                     "-profile:v", "main10", *TEN_BIT],
+    }[enc.name]
+    return enc._replace(args=args)
+
+
+def audio_rate(enc, channels):
+    """About how many kb/s an audio encoder makes, or a guess for copied audio whose bitrate ffmpeg doesn't give."""
+    channels = channels or 2
+    if enc is None:
+        return 640 if channels > 2 else 192  # a generous guess, so the file comes in under the size, not over
+    if channels > 2 and enc.family in SURROUND_BITRATE:
+        return int(SURROUND_BITRATE[enc.family].rstrip("k"))
+    if "-b:a" in enc.args:
+        return int(enc.args[enc.args.index("-b:a") + 1].rstrip("k"))
+    if enc.family == "pcm":
+        return 1152 * channels  # 24-bit at 48 kHz
+    if enc.family in LOSSLESS:
+        return 600 * channels  # FLAC and ALAC vary with the sound; this is typical of film
+    return 80 * channels  # Vorbis at quality 5
+
+
+def parse_size(text, unit):
+    """Bytes from what was typed in the size box, such as "1.5" or "700", or None if it isn't a size."""
+    try:
+        value = float(text.strip().replace(",", "."))
+    except ValueError:
+        return None
+    return value * (1e9 if unit == "GB" else 1e6) if value > 0 else None
+
+
 def detect_encoders(ffmpeg):
-    """Return (video, audio) encoders this ffmpeg can use. Hardware encoders are test-run,
-    since being compiled in doesn't mean the machine has the hardware."""
+    """Return the (video, audio, size) encoders this ffmpeg can use. Hardware encoders are test-run, since being
+    compiled in doesn't mean the machine has the hardware; so are the size ones, since not every build does 10-bit."""
     listing = run([ffmpeg, "-hide_banner", "-encoders"]).stdout
     built_in = {line.split()[1] for line in listing.splitlines() if len(line.split()) > 1}
 
@@ -183,24 +317,53 @@ def detect_encoders(ffmpeg):
             families.add(enc.family)
             video.append(enc)
     # Each test can take seconds while a driver wakes up, so run them side by side rather than one after another.
-    candidates = [enc for enc in HARDWARE_VIDEO if enc.name in built_in]
+    candidates = [enc for enc in HARDWARE_VIDEO + SIZES + HARDWARE_SIZES if enc.name in built_in]
+    working = []
     if candidates:
         with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
-            video += [enc for enc, ok in zip(candidates, pool.map(works, candidates)) if ok]
+            working = [enc for enc, ok in zip(candidates, pool.map(works, candidates)) if ok]
+    video += [enc for enc in working if enc in HARDWARE_VIDEO]
+    sizes = [enc for enc in working if enc not in HARDWARE_VIDEO]
     audio = [enc for enc in AUDIO if enc.name in built_in]
-    return video, audio
+    return video, audio, sizes
 
 
 def media_info(ffmpeg, path):
-    """Length in seconds and first video/audio codec, parsed from ffmpeg's input summary (avoids needing ffprobe)."""
+    """Length in seconds, first video/audio codec and a few facts about them, parsed from ffmpeg's input summary
+    (avoids needing ffprobe)."""
     err = run([ffmpeg, "-hide_banner", "-i", path]).stderr
     duration = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", err)
-    video = re.search(r"Stream #\S+.*?: Video: (\w+)(?!.*attached pic)", err)  # cover art isn't video
-    audio = re.search(r"Stream #\S+.*?: Audio: (\w+)", err)
+    bitrate = re.search(r"Duration: .*bitrate: (\d+) kb/s", err)
+    video = re.search(r"Stream #\S+.*?: Video: (\w+)(?!.*attached pic)(.*)", err)  # cover art isn't video
+    audio = re.search(r"Stream #\S+.*?: Audio: (\w+)(.*)", err)
     if duration:
         h, m, s = duration.groups()
         duration = int(h) * 3600 + int(m) * 60 + float(s)
-    return Media(duration or None, video and video.group(1), audio and audio.group(1))
+    bpp = pixel_rate = None
+    size = video and re.search(r", (\d{2,5})x(\d{2,5})", video.group(2))
+    fps = video and re.search(r", ([\d.]+) fps", video.group(2))
+    if size and fps and float(fps.group(1)):
+        pixel_rate = int(size.group(1)) * int(size.group(2)) * float(fps.group(1))
+    if bitrate and pixel_rate:
+        bpp = int(bitrate.group(1)) * 1000 / pixel_rate
+    audio_kbps = []
+    for line in re.findall(r"Stream #\S+.*?: Audio: .*", err):
+        rate = re.search(r", (\d+) kb/s", line)
+        audio_kbps.append(rate and int(rate.group(1)))
+    channels = lossless = None
+    if audio:
+        codec, rest = audio.groups()
+        lossless = codec.startswith("pcm_") or codec in LARGE_AUDIO or "DTS-HD MA" in rest
+        layout = re.search(r" Hz, ([^,]+)", rest)
+        layout = layout and layout.group(1)
+        if layout in ("mono", "stereo"):
+            channels = 1 if layout == "mono" else 2
+        elif layout and re.match(r"\d+\.\d+", layout):  # 5.1, 7.1(wide), …
+            channels = sum(int(n) for n in re.match(r"(\d+)\.(\d+)", layout).groups())
+        elif layout and re.match(r"\d+ channels", layout):
+            channels = int(layout.split()[0])
+    return Media(duration or None, video and video.group(1), audio and audio.group(1), bpp, channels, lossless,
+                 pixel_rate, tuple(audio_kbps))
 
 
 def clock(seconds):
@@ -211,6 +374,14 @@ def clock(seconds):
 
 def span(seconds):
     return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.0f} min"
+
+
+def file_size(size):
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1000:
+            return f"{size:.1f} {unit}" if unit == "MB" and size < 10 else f"{size:.0f} {unit}"
+        size /= 1000
+    return f"{size:.1f} GB"
 
 
 def short_folder(path, limit=44):
@@ -368,6 +539,10 @@ class ReMuxApp(tk.Tk):
         self.container = tk.StringVar(value="MP4")
         self.vcodec = tk.StringVar(value=COPY)
         self.acodec = tk.StringVar(value=COPY)
+        self.size = tk.StringVar(value=ORIGINAL_SIZE)
+        self.use_hardware = tk.BooleanVar()
+        self.target_value = tk.StringVar()  # the size wanted, for Fit a size
+        self.target_unit = tk.StringVar(value="GB")
         self.video_name = tk.StringVar()  # file names shown in the fields; the *_path vars hold full paths
         self.audio_name = tk.StringVar()
         self.video_details = tk.StringVar()
@@ -380,12 +555,14 @@ class ReMuxApp(tk.Tk):
         self.options_open = False
         # Folders are remembered between launches: where videos and audio were last picked, and the output folder.
         self.settings = load_settings()
+        self.use_hardware.set(bool(self.settings.get("hardware")))
         saved_dir = self.settings.get("output_dir")
         self.output_dir = saved_dir if saved_dir and os.path.isdir(saved_dir) else None  # None: next to the video
         self.just_saved = False  # until the inputs change, the window describes the finished job
 
-        self.video_encoders = {}  # label -> Encoder
-        self.audio_encoders = {}
+        self.video_encoders = {}  # label -> (software, hardware) Encoders, either possibly None
+        self.audio_encoders = {}  # label -> Encoder
+        self.size_encoders = {}  # label -> (software, hardware) Encoders that make the file smaller
         self.media = {}  # path -> Media, or None while it's being read
         self.audio_info = None  # (path, codec or None) for the audio the output will use
         self.auto_acodec = None  # audio codec ReMux picked because Copy wouldn't work
@@ -395,6 +572,8 @@ class ReMuxApp(tk.Tk):
         self.installing = False
         self.started_at = 0.0
         self.job_output = None
+        self.job_original = None  # the video's size when making it smaller, to check the new one against
+        self.job_target = None  # the size wanted, when fitting one
         self.tmp_output = None
         self.last_output = None
 
@@ -407,10 +586,15 @@ class ReMuxApp(tk.Tk):
         self.audio_path.trace_add("write", self._probe_files)
         self.acodec.trace_add("write", lambda *_: self._check_fit())
         self.vcodec.trace_add("write", lambda *_: self._check_fit())
+        self.size.trace_add("write", self._on_size_changed)
+        self.use_hardware.trace_add("write", self._on_hardware_changed)
+        for var in (self.target_value, self.target_unit):
+            var.trace_add("write", lambda *_: self._check_fit())
         self.audio_path.trace_add("write", lambda *_: self.running or self.run_btn.config(text=self._action()))
         self._on_options_changed()
         self._show_file_details()
-        for var in (self.video_path, self.audio_path, self.container, self.vcodec, self.acodec):
+        for var in (self.video_path, self.audio_path, self.container, self.vcodec, self.acodec, self.size,
+                    self.use_hardware, self.target_value, self.target_unit):
             var.trace_add("write", lambda *_: setattr(self, "just_saved", False))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -466,11 +650,27 @@ class ReMuxApp(tk.Tk):
         self.options_btn = ttk.Button(root, text="Change…", command=self._toggle_options)
         self.options_btn.grid(row=5, column=2, sticky="ew")
         self.option_rows = [
-            self._combo(root, 6, "Format", self.container, list(CONTAINERS), pady=(12, 2)),
-            self._combo(root, 7, "Video codec", self.vcodec, [COPY]),
-            self._combo(root, 8, "Audio codec", self.acodec, [COPY]),
+            self._combo(root, 6, "Size", self.size, [ORIGINAL_SIZE], pady=(12, 2)),
+            self._combo(root, 7, "Format", self.container, list(CONTAINERS)),
+            self._combo(root, 8, "Video codec", self.vcodec, [COPY]),
+            self._combo(root, 9, "Audio codec", self.acodec, [COPY]),
         ]
-        self.vbox, self.abox = self.option_rows[1][1], self.option_rows[2][1]
+        self.sizebox, self.formatbox, self.vbox, self.abox = (box for _, box in self.option_rows)
+        self.target_frame = ttk.Frame(root)
+        self.target_frame.grid(row=6, column=2, sticky="ew", pady=(12, 2))
+        self.target_entry = ttk.Entry(self.target_frame, textvariable=self.target_value, width=6, justify="right")
+        self.target_entry.pack(side="left", fill="x", expand=True)
+        self.unit_box = ttk.Combobox(self.target_frame, textvariable=self.target_unit, values=["MB", "GB"],
+                                     state="readonly", width=3)
+        self.unit_box.pack(side="left", padx=(4, 0))
+        self.target_frame.grid_remove()
+        # The menus name codecs; this decides whether the computer's video hardware makes them.
+        speed = ttk.Label(root, text="Speed")
+        speed.grid(row=10, column=0, sticky="w", pady=2)
+        self.hardware_check = ttk.Checkbutton(root, text="Use graphics hardware (much faster, larger files)",
+                                              variable=self.use_hardware)
+        self.hardware_check.grid(row=10, column=1, sticky="w", padx=8, pady=2)
+        self.option_rows.append((speed, self.hardware_check))
         # Size the label column for the hidden option labels too, so opening them doesn't widen the window.
         root.columnconfigure(0, minsize=max(text.winfo_reqwidth() for text, _ in self.option_rows))
         for widgets in self.option_rows:
@@ -478,33 +678,33 @@ class ReMuxApp(tk.Tk):
                 widget.grid_remove()
         # Shown, open or not, when the video or audio can't simply be copied into the chosen format.
         self.note_label = ttk.Label(root, textvariable=self.audio_note, style="Note.TLabel")
-        self.note_label.grid(row=9, column=1, sticky="w", padx=8, pady=(4, 0))
+        self.note_label.grid(row=11, column=1, sticky="w", padx=8, pady=(4, 0))
         # The note's suggestion as a button, so it's one click rather than a trip into the options.
         self.note_btn = ttk.Button(root, command=lambda: self.container.set(self.note_action))
-        self.note_btn.grid(row=9, column=2, sticky="new", pady=(4, 0))
+        self.note_btn.grid(row=11, column=2, sticky="new", pady=(4, 0))
         self.note_btn.grid_remove()
         self.note_action = None
         self.note_label.grid_remove()
 
-        ttk.Separator(root).grid(row=10, column=0, columnspan=3, sticky="ew", pady=16)
+        ttk.Separator(root).grid(row=12, column=0, columnspan=3, sticky="ew", pady=16)
 
         # Where the new file goes: its name, then the folder, matching the file rows above.
-        ttk.Label(root, text="Save as").grid(row=11, column=0, sticky="w")
+        ttk.Label(root, text="Save as").grid(row=13, column=0, sticky="w")
         self.save_name_label = ttk.Label(root, textvariable=self.save_name, font=self.name_font)
-        self.save_name_label.grid(row=11, column=1, sticky="w", padx=8)
+        self.save_name_label.grid(row=13, column=1, sticky="w", padx=8)
         self.folder_btn = ttk.Button(root, text="Choose Folder…", command=self._pick_folder)
-        self.folder_btn.grid(row=11, column=2, sticky="ew")
+        self.folder_btn.grid(row=13, column=2, sticky="ew")
         self.save_details_label = ttk.Label(root, textvariable=self.save_details, **hint)
-        self.save_details_label.grid(row=12, column=1, sticky="nw", padx=8, pady=(4, 0))
+        self.save_details_label.grid(row=14, column=1, sticky="nw", padx=8, pady=(4, 0))
         self.same_folder_btn = ttk.Button(root, text="Use Video's Folder", command=self._use_video_folder)
-        self.same_folder_btn.grid(row=12, column=2, sticky="new", pady=(4, 0))
+        self.same_folder_btn.grid(row=14, column=2, sticky="new", pady=(4, 0))
         self.same_folder_btn.grid_remove()
 
-        ttk.Separator(root).grid(row=13, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        ttk.Separator(root).grid(row=15, column=0, columnspan=3, sticky="ew", pady=(16, 0))
 
         # Footer: what's happening on the left, actions on the right. The bar appears only while something runs.
         footer = ttk.Frame(root)
-        footer.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        footer.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(16, 0))
         footer.columnconfigure(0, weight=1)
         self.status_label = ttk.Label(footer, textvariable=self.status_var)
         self.status_label.grid(row=0, column=0, sticky="sw")
@@ -623,17 +823,146 @@ class ReMuxApp(tk.Tk):
 
     def _toggle_options(self):
         self.options_open = not self.options_open
-        for widgets in self.option_rows:
-            for widget in widgets:
-                widget.grid() if self.options_open else widget.grid_remove()
+        self._show_option_rows()
         self.options_btn.config(text="Hide Options" if self.options_open else "Change…")
         if self.options_open:
             self.option_rows[0][1].focus_set()
 
+    def _show_option_rows(self):
+        # While a size is chosen it decides the video codec, so that menu would only be in the way.
+        # The hardware switch only appears on computers with video hardware ReMux has checked works.
+        has_hardware = any(hardware for _, hardware in [*self.video_encoders.values(), *self.size_encoders.values()])
+        for widgets in self.option_rows:
+            shown = self.options_open and not (widgets[1] is self.vbox and self._size_encoder()) and not (
+                widgets[1] is self.hardware_check and not has_hardware)
+            for widget in widgets:
+                widget.grid() if shown else widget.grid_remove()
+        self.target_frame.grid() if self.options_open and self._fitting() else self.target_frame.grid_remove()
+
+    def _fitting(self):
+        return self.size.get() == FIT_SIZE and bool(self._size_encoder())
+
+    def _audio_kbps(self):
+        """About how many kb/s the new file's sound will take, for fitting a size."""
+        audio = self.audio_path.get()
+        info = self.media.get(audio or self.video_path.get())
+        if not info or not info.audio:
+            return 0
+        tracks = info.audio_kbps[:1] if audio else info.audio_kbps  # a separate file gives its first track
+        enc = self.audio_encoders.get(self.acodec.get())
+        return sum(audio_rate(enc, info.channels) if enc else kbps or audio_rate(None, info.channels)
+                   for kbps in tracks)
+
+    def _fit_plan(self):
+        """What the size wanted leaves for the picture, and what that will look like.
+        Returns (video kb/s or None, note, problem); problem is None, "poor" (ask first) or "stop"."""
+        video = self.video_path.get()
+        info = self.media.get(video)
+        target = parse_size(self.target_value.get(), self.target_unit.get())
+        if target is None:
+            return None, "Type the size you want the new file to be, such as 700 MB or 2 GB.", "stop"
+        if not info:
+            return None, "", "stop"  # nothing to work it out from yet
+        name = os.path.basename(video)
+        if not info.duration:
+            return None, f"ReMux can't tell how long {name} is, so it can't fit it to a size.", "stop"
+        original, wanted = os.path.getsize(video), file_size(target)
+        if target >= original * WORTH_KEEPING:
+            return None, (f"{name} is already {file_size(original)}, so {wanted} wouldn't make it smaller. "
+                          "Choose a smaller size, or Keep original."), "stop"
+        total = target * 8 / 1000 / info.duration * OVERHEAD
+        audio = self._audio_kbps()
+        kbps = int(total - audio)
+        if kbps < FIT_MIN_KBPS:
+            return None, (f"{wanted} is too small for {clock(info.duration)} of video: the sound alone needs "
+                          f"about {file_size(audio * 1000 / 8 * info.duration)}. Choose a bigger size."), "stop"
+        rate = f"{kbps / 1000:.1f} Mbps" if kbps >= 1000 else f"{kbps} kbps"
+        note = f"At {wanted}, the picture gets about {rate}."
+        if audio > total * 0.3:
+            note += f" The sound takes {audio / total:.0%} of the space."
+        if not info.pixel_rate:
+            return kbps, note, None
+        quality = kbps * 1000 / info.pixel_rate * (info.pixel_rate / REF_PIXEL_RATE) ** 0.25
+        if is_hardware(self._size_encoder()):
+            quality *= HARDWARE_EFFICIENCY
+        note += " " + next(text for floor, text in FIT_QUALITY if quality >= floor)
+        return kbps, note, "poor" if quality < FIT_POOR else None
+
+    def _pick(self, pair):
+        """The encoder to use from a (software, hardware) pair: hardware when it's switched on and there is one."""
+        software, hardware = pair or (None, None)
+        return (self.use_hardware.get() and hardware) or software or hardware
+
+    def _size_encoder(self):
+        return self._pick(self.size_encoders.get(self.size.get()))
+
+    def _video_encoder(self):
+        """The encoder that will make the video, from Size or the video codec menu; None to copy it."""
+        return self._size_encoder() or self._pick(self.video_encoders.get(self.vcodec.get()))
+
+    def _on_hardware_changed(self, *_):
+        self._remember("hardware", self.use_hardware.get())
+        self._check_fit()
+
+    def _speed_note(self):
+        """What the encoder choice means for time and file size, when the video is re-encoded."""
+        enc = self._video_encoder()
+        if not enc:
+            return ""
+        pair = (self.size_encoders if self._size_encoder() else self.video_encoders)[enc.label]
+        if is_hardware(enc):
+            return (f"Encoding with {HARDWARE_NAMES[enc.name.rsplit('_', 1)[-1]]}: much faster, but the file "
+                    "comes out larger than the slower software encoder would make it at the same quality.")
+        if self.use_hardware.get():
+            return (f"This computer can't encode {VIDEO_NAMES[enc.family]} video in hardware, so it will be done in "
+                    "software, which is slower.")
+        if self._size_encoder():
+            slow = ("It reads the video twice to share out the space well, so expect it to take about twice as "
+                    "long as the video plays, or longer." if self._fitting() and enc.name in TWO_PASS
+                    else SLOW_NOTE.strip())
+            return slow + (" Turn on Use graphics hardware to make it much faster." if pair[1] else "")
+        return ""
+
+    def _on_size_changed(self, *_):
+        """Offer only the formats that hold the codec a size uses, and say what it will do to the picture."""
+        enc = self._size_encoder()
+        formats = [label for label, (_, allowed) in CONTAINERS.items() if not enc or enc.family in allowed]
+        self.formatbox.config(values=formats)
+        self._show_option_rows()
+        if self.container.get() not in formats:
+            self.container.set("MP4")  # holds every size codec, and plays almost everywhere
+            self.status_var.set(f"Format set to MP4, which can hold {VIDEO_NAMES[enc.family]} video.")
+        if self._fitting():
+            self._suggest_target()
+            self.target_entry.focus_set()
+        self._check_fit(adjust=True)
+
+    def _suggest_target(self):
+        """Start the size box at about half the original, which usually still looks good."""
+        video = self.video_path.get()
+        if self.target_value.get() or not video or not os.path.exists(video):
+            return
+        half = os.path.getsize(video) / 2
+        if half >= 1e9:
+            self.target_unit.set("GB")
+            self.target_value.set(f"{half / 1e9:.1f}")
+        else:
+            self.target_unit.set("MB")
+            self.target_value.set(f"{max(10, round(half / 1e7) * 10):.0f}")
+
     def _summarize(self):
+        enc = self._size_encoder()
         video = "original video" if self.vcodec.get() == COPY else f"video as {self.vcodec.get()}"
+        if enc:
+            video = f"smaller {VIDEO_NAMES[enc.family]} video"
+        if self._fitting():
+            target = parse_size(self.target_value.get(), self.target_unit.get())
+            video = f"{VIDEO_NAMES[enc.family]} video fitted to {file_size(target)}" if target else video
+        used = self._video_encoder()
+        if used and is_hardware(used):
+            video += " (hardware)"
         audio = "original audio" if self.acodec.get() == COPY else f"audio as {self.acodec.get()}"
-        if self.vcodec.get() == self.acodec.get() == COPY:
+        if self.vcodec.get() == self.acodec.get() == COPY and not enc:
             body = "original video and audio, no quality loss"
         else:
             body = f"{video}, {audio}"
@@ -652,8 +981,17 @@ class ReMuxApp(tk.Tk):
         self._remember("video_dir", os.path.dirname(path))
         ext = os.path.splitext(path)[1].lstrip(".").lower()
         container = EXT_TO_CONTAINER.get(ext, "MKV")  # MKV accepts nearly anything
+        size = self._size_encoder()
+        if size and size.family not in CONTAINERS[container][1]:
+            container = "MP4"
         self.container.set(container)
         self.video_path.set(path)
+        if self._fitting():  # the old size was for the old video
+            self.target_value.set("")
+            self._suggest_target()
+        if size and container == "MP4" and EXT_TO_CONTAINER.get(ext) != "MP4":
+            self.status_var.set(f"Format set to MP4, which can hold the smaller {VIDEO_NAMES[size.family]} video.")
+            return
         same = EXT_TO_CONTAINER.get(ext) == container
         self.status_var.set(f"Format set to {container} to match your video." if same else
                             "Format set to MKV, which can hold this video.")
@@ -735,9 +1073,10 @@ class ReMuxApp(tk.Tk):
     def _on_options_changed(self, *_):
         """Offer only codecs the chosen format can hold, and preview the output path."""
         allowed = CONTAINERS[self.container.get()][1]
-        for box, var, encoders in ((self.vbox, self.vcodec, self.video_encoders),
-                                   (self.abox, self.acodec, self.audio_encoders)):
-            labels = [COPY] + [label for label, enc in encoders.items() if enc.family in allowed]
+        families = ({label: (pair[0] or pair[1]).family for label, pair in self.video_encoders.items()},
+                    {label: enc.family for label, enc in self.audio_encoders.items()})
+        for box, var, family in ((self.vbox, self.vcodec, families[0]), (self.abox, self.acodec, families[1])):
+            labels = [COPY] + [label for label in family if family[label] in allowed]
             box.config(values=labels)
             if var.get() not in labels:
                 if var.get() not in (COPY, self.auto_acodec) and not self.running:
@@ -859,7 +1198,17 @@ class ReMuxApp(tk.Tk):
         if video and not video.video:
             notes.append(f"{os.path.basename(self.video_path.get())} has no video in it. "
                          "Choose a video file, and put this one under Audio if it's the new sound.")
-        if (video and video.video in VIDEO_FAMILIES and self.vcodec.get() == COPY
+        size = self._size_encoder()
+        if self._fitting():
+            notes.append(self._fit_plan()[1])
+        elif size:
+            notes.append(SIZE_NOTES[size.family])
+        notes.append(self._speed_note())
+        if size and not self._fitting():
+            if video and (video.video in EFFICIENT_VIDEO or (video.bpp and video.bpp < TIGHT_BPP)):
+                notes.append("This video is already tightly compressed, so it may not get much smaller, and every "
+                             "re-encode loses a little detail. If the new file isn't smaller, ReMux won't keep it.")
+        if (video and video.video in VIDEO_FAMILIES and self.vcodec.get() == COPY and not size
                 and video.video not in CONTAINERS[container][1]):
             ext = os.path.splitext(self.video_path.get())[1].lstrip(".").lower()
             match = EXT_TO_CONTAINER.get(ext, "MKV")  # the video's own format, which holds it by definition
@@ -878,16 +1227,24 @@ class ReMuxApp(tk.Tk):
             else:
                 family = codec_family(codec)
                 fits = container == "MKV" or family in CONTAINERS[container][1]
-                if fits and adjust and self.auto_acodec and self.acodec.get() == self.auto_acodec:
-                    # ReMux only converted because the old format needed it; this one doesn't, so keep the original.
+                # Lossless audio can be a third of a film's size, so making the file smaller converts it too.
+                shrink = bool(size and getattr(self.media.get(source), "lossless", False))
+                if fits and not shrink and adjust and self.auto_acodec and self.acodec.get() == self.auto_acodec:
+                    # ReMux only converted because the old format or size needed it; now neither does.
                     self.auto_acodec = None
                     self.acodec.set(COPY)
-                if not fits:
+                if not fits or shrink:
                     name = self._audio_name(codec)
                     if adjust and self.acodec.get() == COPY:
-                        self._pick_fallback_audio(container, family)
+                        self._pick_fallback_audio(container, family, keep_lossless=not shrink)
                     choice = self.acodec.get()
-                    if choice == COPY:
+                    if fits and choice == COPY:
+                        note = (f"The {name} audio is lossless and takes a lot of space. "
+                                "Choose an audio codec such as AAC to make the file smaller still.")
+                    elif fits and choice == self.auto_acodec:
+                        note = (f"The {name} audio is lossless and takes a lot of space, so it will be converted "
+                                f"to {choice}. Most people can't hear the difference.")
+                    elif choice == COPY:
                         note = (f"{name} audio can't go into {container} as it is. "
                                 "Choose an audio codec, or switch the format to MKV.")
                         self.note_action = self.note_action or "MKV"
@@ -911,8 +1268,9 @@ class ReMuxApp(tk.Tk):
         else:
             self.note_btn.grid_remove()
 
-    def _pick_fallback_audio(self, container, family):
-        prefer = (["alac"] if family in LOSSLESS and container == "MOV" else []) + FALLBACK_AUDIO[container]
+    def _pick_fallback_audio(self, container, family, keep_lossless=True):
+        keep = keep_lossless and family in LOSSLESS and container == "MOV"
+        prefer = (["alac"] if keep else []) + FALLBACK_AUDIO[container]
         for wanted in prefer:
             for label, enc in self.audio_encoders.items():
                 if enc.family == wanted:
@@ -937,7 +1295,8 @@ class ReMuxApp(tk.Tk):
     def _lock_inputs(self, locked):
         """While a job runs, the window must keep describing that job, so nothing that changes it stays live."""
         widgets = [self.video_btn, self.audio_btn, self.remove_btn, self.options_btn, self.folder_btn,
-                   self.same_folder_btn, self.note_btn] + [box for _, box in self.option_rows]
+                   self.same_folder_btn, self.note_btn, self.target_entry, self.unit_box] + [
+                       box for _, box in self.option_rows]
         for widget in widgets:
             widget.state(["disabled"] if locked else ["!disabled"])
 
@@ -958,14 +1317,20 @@ class ReMuxApp(tk.Tk):
         self.status_var.set("Checking which codecs this computer can use…")
 
         def worker():
-            video, audio = detect_encoders(self.ffmpeg)
-            self.after(0, self._on_encoders_detected, video, audio)
+            self.after(0, self._on_encoders_detected, *detect_encoders(self.ffmpeg))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_encoders_detected(self, video, audio):
-        self.video_encoders = {enc.label: enc for enc in video}
+    def _on_encoders_detected(self, video, audio, sizes):
+        self.video_encoders = by_label(video)
         self.audio_encoders = {enc.label: enc for enc in audio}
+        self.size_encoders = by_label(sizes)
+        if SMALLER in self.size_encoders:
+            self.size_encoders[FIT_SIZE] = self.size_encoders[SMALLER]
+        self.sizebox.config(values=[ORIGINAL_SIZE, *self.size_encoders])
+        if self.size.get() not in self.size_encoders:
+            self.size.set(ORIGINAL_SIZE)
+        self._show_option_rows()
         self._on_options_changed()
         self._probe_files()  # ffmpeg may have only just been installed
         if not self.running:
@@ -1041,6 +1406,17 @@ class ReMuxApp(tk.Tk):
             messagebox.showwarning("No audio in this file", f"{os.path.basename(audio)} has no audio track.",
                                    detail="Choose a different audio file.")
             return
+        fit_kbps = None
+        if self._fitting():
+            fit_kbps, note, problem = self._fit_plan()
+            if problem == "stop":
+                messagebox.showwarning("Can't fit that size", note or "ReMux is still reading the video.",
+                                       detail="" if note else "Try again in a moment.")
+                return
+            if problem == "poor" and not messagebox.askokcancel(
+                    "The picture will look poor", note, icon="warning",
+                    detail="Make it at this size anyway? A bigger size looks much better."):
+                return
 
         output = self._output_path()
         if os.path.exists(output):
@@ -1067,11 +1443,18 @@ class ReMuxApp(tk.Tk):
         self.started_at = time.monotonic()
         self.job_output, self.tmp_output = output, tmp
         self._set_busy(True, f"{self._doing()}…")
-        venc = self.video_encoders.get(self.vcodec.get())
+        venc = self._video_encoder()
         aenc = self.audio_encoders.get(self.acodec.get())
+        # Smaller files are only kept if they really are smaller; with new audio, the sizes can't be compared.
+        # A size that was asked for is kept: it was already checked against the original.
+        self.job_original = (os.path.getsize(video) if self._size_encoder() and not audio and not fit_kbps
+                             else None)
+        self.job_target = fit_kbps and parse_size(self.target_value.get(), self.target_unit.get())
+        channels = getattr(self.media.get(audio or video), "channels", None)
         # Lengths were already read when the files were picked; the worker only reads any that are missing.
         known = [getattr(self.media.get(path), "duration", None) for path in (video, audio)]
-        threading.Thread(target=self._remux, args=(video, audio, venc, aenc, tmp, *known), daemon=True).start()
+        threading.Thread(target=self._remux, args=(video, audio, venc, aenc, tmp, channels, fit_kbps, *known),
+                         daemon=True).start()
 
     def _ask_existing(self, output):
         """Ask what to do about a file that's already there, with buttons that say what they do.
@@ -1127,7 +1510,7 @@ class ReMuxApp(tk.Tk):
             if self.proc:
                 self.proc.terminate()
 
-    def _build_command(self, video, audio, venc, aenc, output, shortest):
+    def _build_command(self, video, audio, venc, aenc, output, shortest, channels=None):
         cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y",
                "-i", video]
         if audio:
@@ -1136,6 +1519,8 @@ class ReMuxApp(tk.Tk):
             cmd += ["-map", "0:v:0", "-map", "0:a?"]
         cmd += ["-c:v", venc.name, *venc.args] if venc else ["-c:v", "copy"]
         cmd += ["-c:a", aenc.name, *aenc.args] if aenc else ["-c:a", "copy"]
+        if aenc and channels and channels > 2 and aenc.family in SURROUND_BITRATE:
+            cmd += ["-b:a", SURROUND_BITRATE[aenc.family]]  # the later -b:a wins
         if shortest:
             cmd += ["-shortest"]
         if output.endswith((".mp4", ".mov")):
@@ -1144,7 +1529,8 @@ class ReMuxApp(tk.Tk):
                 cmd += ["-tag:v", "hvc1"]  # lets Apple players open HEVC
         return cmd + [output]
 
-    def _remux(self, video, audio, venc, aenc, tmp, duration=None, audio_duration=None):
+    def _remux(self, video, audio, venc, aenc, tmp, channels=None, fit_kbps=None, duration=None,
+               audio_duration=None):
         duration = duration or media_info(self.ffmpeg, video).duration
         doing = self._doing()  # read here, before the worker loop, while it matches the job
         started = self.started_at
@@ -1154,28 +1540,54 @@ class ReMuxApp(tk.Tk):
         # Shorter audio is left alone, so the video is never trimmed.
         audio_duration = audio and (audio_duration or media_info(self.ffmpeg, audio).duration)
         shortest = bool(duration and audio_duration and audio_duration > duration)
-        cmd = self._build_command(video, audio, venc, aenc, tmp, shortest)
+        # Fitting a size in software takes two passes: the first only reads the video and notes how hard each
+        # part is, into a stats file in a folder of its own; the second shares the bits out using it.
+        workdir = None
+        if fit_kbps and venc.name in TWO_PASS:
+            workdir = tempfile.mkdtemp(prefix="remux-")
+            first = fit_encoder(venc, fit_kbps, 1)
+            passes = [[self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats", "-progress", "pipe:1",
+                       "-y", "-i", video, "-map", "0:v:0", "-c:v", first.name, *first.args, "-an", "-f", "null", "-"],
+                      self._build_command(video, audio, fit_encoder(venc, fit_kbps, 2), aenc, tmp, shortest,
+                                          channels)]
+        else:
+            venc = fit_encoder(venc, fit_kbps) if fit_kbps else venc
+            passes = [self._build_command(video, audio, venc, aenc, tmp, shortest, channels)]
 
+        code = None
         with tempfile.TemporaryFile(mode="w+", errors="replace") as log:
             try:
-                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, errors="replace",
-                                             creationflags=NO_WINDOW)
-            except OSError as e:
-                self.after(0, self._on_finished, None, tmp, f"Couldn't start ffmpeg: {e.strerror}")
-                return
-            if self.cancelled:  # Cancel was pressed before ffmpeg started
-                self.proc.terminate()
-            for line in self.proc.stdout:
-                key, _, value = line.strip().partition("=")
-                if key == "out_time_us" and duration and value.isdigit():
-                    percent = min(100.0, int(value) / 1e6 / duration * 100)
-                    elapsed = time.monotonic() - started
-                    # The first few seconds include ffmpeg starting up, so wait before estimating.
-                    estimate = 2 <= percent < 99 and elapsed >= 3
-                    left = f" · {time_left(elapsed * (100 - percent) / percent)}" if estimate else ""
-                    self.after(0, lambda p=percent, left=left: (self.progress.config(value=p),
-                                                                self.status_var.set(f"{doing}… {p:.0f}%{left}")))
-            code = self.proc.wait()
+                for number, cmd in enumerate(passes):
+                    if self.cancelled:
+                        break
+                    step = f" (pass {number + 1} of {len(passes)})" if len(passes) > 1 else ""
+                    try:
+                        # SVT-AV1 writes its settings to the log unless told not to, burying any error.
+                        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True,
+                                                     errors="replace", creationflags=NO_WINDOW, cwd=workdir,
+                                                     env={**os.environ, "SVT_LOG": "1"})
+                    except OSError as e:
+                        self.after(0, self._on_finished, None, tmp, f"Couldn't start ffmpeg: {e.strerror}")
+                        return
+                    if self.cancelled:  # Cancel was pressed before ffmpeg started
+                        self.proc.terminate()
+                    for line in self.proc.stdout:
+                        key, _, value = line.strip().partition("=")
+                        if key == "out_time_us" and duration and value.isdigit():
+                            done = min(1.0, int(value) / 1e6 / duration)
+                            percent = (number + done) / len(passes) * 100
+                            elapsed = time.monotonic() - started
+                            # The first few seconds include ffmpeg starting up, so wait before estimating.
+                            estimate = 2 <= percent < 99 and elapsed >= 3
+                            left = f" · {time_left(elapsed * (100 - percent) / percent)}" if estimate else ""
+                            self.after(0, lambda p=percent, text=f"{doing}{step}… {percent:.0f}%{left}": (
+                                self.progress.config(value=p), self.status_var.set(text)))
+                    code = self.proc.wait()
+                    if code != 0:
+                        break
+            finally:
+                if workdir:
+                    shutil.rmtree(workdir, ignore_errors=True)
             log.seek(0)
             message = log.read().strip()
         self.after(0, self._on_finished, code, tmp, message)
@@ -1185,6 +1597,22 @@ class ReMuxApp(tk.Tk):
         self._set_busy(False)
         output = self.job_output
         if code == 0 and not self.cancelled:
+            saved = ""
+            if self.job_original:
+                new = os.path.getsize(tmp)
+                if new >= self.job_original * WORTH_KEEPING:
+                    self._discard(tmp)
+                    self.status_var.set("The new file wasn't smaller, so it wasn't saved.")
+                    messagebox.showinfo(
+                        "The video didn't get smaller",
+                        f"The new file came out at {file_size(new)}, against {file_size(self.job_original)} "
+                        "for the original, so ReMux didn't save it.",
+                        detail="This video is already compressed about as far as it can go without losing "
+                               "visible quality. Keep the original.")
+                    return
+                saved = f" · {file_size(new)}, {1 - new / self.job_original:.0%} smaller"
+            elif self.job_target:
+                saved = f" · {file_size(os.path.getsize(tmp))} (you asked for {file_size(self.job_target)})"
             try:
                 os.replace(tmp, output)  # only now is an existing file replaced
             except OSError as e:
@@ -1195,7 +1623,7 @@ class ReMuxApp(tk.Tk):
                 return
             self.last_output = output
             self.just_saved = True
-            self.status_var.set(f"Saved {os.path.basename(output)}")
+            self.status_var.set(f"Saved {os.path.basename(output)}{saved}")
             self.reveal_btn.grid()
             self.reveal_btn.focus_set()
             self._show_output()
