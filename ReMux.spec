@@ -5,7 +5,7 @@
 #   Linux   -> dist/ReMux       (single file)
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MACOS = sys.platform == "darwin"
 
 a = Analysis(["remux.py"], datas=[("assets/icon.png", "assets")])
