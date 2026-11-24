@@ -102,6 +102,15 @@ AUDIO = [
     Encoder("PCM 24-bit (uncompressed)", "pcm", "pcm_s24le", []),
     Encoder("AC-3 (Dolby Digital)", "ac3", "ac3", ["-b:a", "448k"]),
 ]
+# label: (extension, encoder family). Matroska Audio can copy the source track.
+AUDIO_OUTPUTS = {
+    "MKA (original audio)": ("mka", None),
+    "WAV (24-bit PCM)": ("wav", "pcm"),
+    "FLAC (lossless)": ("flac", "flac"),
+    "M4A (AAC)": ("m4a", "aac"),
+    "MP3": ("mp3", "mp3"),
+}
+VIDEO_OUTPUT, AUDIO_OUTPUT = "Video", "Audio only"
 AUDIO_NAMES = {"pcm": "Uncompressed (PCM)", "aac": "AAC", "mp3": "MP3", "opus": "Opus", "vorbis": "Vorbis",
                "flac": "FLAC", "alac": "ALAC", "ac3": "AC-3"}
 # The stereo bitrates above spread too thin over 5.1 or 7.1, so surround audio gets these instead.
@@ -201,6 +210,8 @@ FFMPEG_ERRORS = [
     (r"Permission denied|Operation not permitted", "ReMux isn't allowed to write to that folder. "
                                                    "Move the video somewhere you can save files, such as Documents."),
     (r"Stream map '0:v:0' matches no streams", "{video} has no video track. Choose a video file."),
+    (r"Stream map '0:a:0' matches no streams|Failed to set value '0:a:0' for option 'map'",
+     "{video} has no audio track. Choose a video with audio."),
     (r"Unknown encoder|Error while opening encoder|Could not open encoder|Error initializing output stream",
      "The chosen codec couldn't start on this computer. Choose a different video or audio codec."),
     (r"not currently supported in container|Could not find tag for codec|Only .* supported|"
@@ -536,6 +547,8 @@ class ReMuxApp(tk.Tk):
 
         self.video_path = tk.StringVar()
         self.audio_path = tk.StringVar()
+        self.output_mode = tk.StringVar(value=VIDEO_OUTPUT)
+        self.audio_format = tk.StringVar(value=next(iter(AUDIO_OUTPUTS)))
         self.container = tk.StringVar(value="MP4")
         self.vcodec = tk.StringVar(value=COPY)
         self.acodec = tk.StringVar(value=COPY)
@@ -580,6 +593,8 @@ class ReMuxApp(tk.Tk):
         self._build_ui()
         self._build_menu()
         self.can_drop = self._enable_drop()
+        self.output_mode.trace_add("write", self._on_output_mode_changed)
+        self.audio_format.trace_add("write", lambda *_: (self._show_output(), self._summarize()))
         self.container.trace_add("write", self._on_options_changed)
         self.video_path.trace_add("write", self._on_options_changed)
         self.video_path.trace_add("write", self._probe_files)
@@ -593,8 +608,8 @@ class ReMuxApp(tk.Tk):
         self.audio_path.trace_add("write", lambda *_: self.running or self.run_btn.config(text=self._action()))
         self._on_options_changed()
         self._show_file_details()
-        for var in (self.video_path, self.audio_path, self.container, self.vcodec, self.acodec, self.size,
-                    self.use_hardware, self.target_value, self.target_unit):
+        for var in (self.video_path, self.audio_path, self.output_mode, self.audio_format, self.container,
+                    self.vcodec, self.acodec, self.size, self.use_hardware, self.target_value, self.target_unit):
             var.trace_add("write", lambda *_: setattr(self, "just_saved", False))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -627,7 +642,8 @@ class ReMuxApp(tk.Tk):
         self.video_details_label = ttk.Label(root, textvariable=self.video_details, **hint)
         self.video_details_label.grid(row=1, column=1, sticky="w", padx=8, pady=(4, 0))
 
-        ttk.Label(root, text="Audio").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.audio_label = ttk.Label(root, text="Audio")
+        self.audio_label.grid(row=2, column=0, sticky="w", pady=(12, 0))
         self.audio_entry = ttk.Entry(root, textvariable=self.audio_name, state="readonly", takefocus=0,
                                      font=self.name_font, cursor="hand2")
         self.audio_entry.grid(
@@ -650,14 +666,17 @@ class ReMuxApp(tk.Tk):
         self.options_btn = ttk.Button(root, text="Change…", command=self._toggle_options)
         self.options_btn.grid(row=5, column=2, sticky="ew")
         self.option_rows = [
-            self._combo(root, 6, "Size", self.size, [ORIGINAL_SIZE], pady=(12, 2)),
-            self._combo(root, 7, "Format", self.container, list(CONTAINERS)),
-            self._combo(root, 8, "Video codec", self.vcodec, [COPY]),
-            self._combo(root, 9, "Audio codec", self.acodec, [COPY]),
+            self._combo(root, 6, "Export", self.output_mode, [VIDEO_OUTPUT, AUDIO_OUTPUT], pady=(12, 2)),
+            self._combo(root, 7, "Size", self.size, [ORIGINAL_SIZE]),
+            self._combo(root, 8, "Format", self.container, list(CONTAINERS)),
+            self._combo(root, 8, "Format", self.audio_format, [self.audio_format.get()]),
+            self._combo(root, 9, "Video codec", self.vcodec, [COPY]),
+            self._combo(root, 10, "Audio codec", self.acodec, [COPY]),
         ]
-        self.sizebox, self.formatbox, self.vbox, self.abox = (box for _, box in self.option_rows)
+        self.exportbox, self.sizebox, self.formatbox, self.audio_formatbox, self.vbox, self.abox = (
+            box for _, box in self.option_rows)
         self.target_frame = ttk.Frame(root)
-        self.target_frame.grid(row=6, column=2, sticky="ew", pady=(12, 2))
+        self.target_frame.grid(row=7, column=2, sticky="ew", pady=2)
         self.target_entry = ttk.Entry(self.target_frame, textvariable=self.target_value, width=6, justify="right")
         self.target_entry.pack(side="left", fill="x", expand=True)
         self.unit_box = ttk.Combobox(self.target_frame, textvariable=self.target_unit, values=["MB", "GB"],
@@ -666,10 +685,10 @@ class ReMuxApp(tk.Tk):
         self.target_frame.grid_remove()
         # The menus name codecs; this decides whether the computer's video hardware makes them.
         speed = ttk.Label(root, text="Speed")
-        speed.grid(row=10, column=0, sticky="w", pady=2)
+        speed.grid(row=11, column=0, sticky="w", pady=2)
         self.hardware_check = ttk.Checkbutton(root, text="Use graphics hardware (much faster, larger files)",
                                               variable=self.use_hardware)
-        self.hardware_check.grid(row=10, column=1, sticky="w", padx=8, pady=2)
+        self.hardware_check.grid(row=11, column=1, sticky="w", padx=8, pady=2)
         self.option_rows.append((speed, self.hardware_check))
         # Size the label column for the hidden option labels too, so opening them doesn't widen the window.
         root.columnconfigure(0, minsize=max(text.winfo_reqwidth() for text, _ in self.option_rows))
@@ -678,33 +697,33 @@ class ReMuxApp(tk.Tk):
                 widget.grid_remove()
         # Shown, open or not, when the video or audio can't simply be copied into the chosen format.
         self.note_label = ttk.Label(root, textvariable=self.audio_note, style="Note.TLabel")
-        self.note_label.grid(row=11, column=1, sticky="w", padx=8, pady=(4, 0))
+        self.note_label.grid(row=12, column=1, sticky="w", padx=8, pady=(4, 0))
         # The note's suggestion as a button, so it's one click rather than a trip into the options.
         self.note_btn = ttk.Button(root, command=lambda: self.container.set(self.note_action))
-        self.note_btn.grid(row=11, column=2, sticky="new", pady=(4, 0))
+        self.note_btn.grid(row=12, column=2, sticky="new", pady=(4, 0))
         self.note_btn.grid_remove()
         self.note_action = None
         self.note_label.grid_remove()
 
-        ttk.Separator(root).grid(row=12, column=0, columnspan=3, sticky="ew", pady=16)
+        ttk.Separator(root).grid(row=13, column=0, columnspan=3, sticky="ew", pady=16)
 
         # Where the new file goes: its name, then the folder, matching the file rows above.
-        ttk.Label(root, text="Save as").grid(row=13, column=0, sticky="w")
+        ttk.Label(root, text="Save as").grid(row=14, column=0, sticky="w")
         self.save_name_label = ttk.Label(root, textvariable=self.save_name, font=self.name_font)
-        self.save_name_label.grid(row=13, column=1, sticky="w", padx=8)
+        self.save_name_label.grid(row=14, column=1, sticky="w", padx=8)
         self.folder_btn = ttk.Button(root, text="Choose Folder…", command=self._pick_folder)
-        self.folder_btn.grid(row=13, column=2, sticky="ew")
+        self.folder_btn.grid(row=14, column=2, sticky="ew")
         self.save_details_label = ttk.Label(root, textvariable=self.save_details, **hint)
-        self.save_details_label.grid(row=14, column=1, sticky="nw", padx=8, pady=(4, 0))
+        self.save_details_label.grid(row=15, column=1, sticky="nw", padx=8, pady=(4, 0))
         self.same_folder_btn = ttk.Button(root, text="Use Video's Folder", command=self._use_video_folder)
-        self.same_folder_btn.grid(row=14, column=2, sticky="new", pady=(4, 0))
+        self.same_folder_btn.grid(row=15, column=2, sticky="new", pady=(4, 0))
         self.same_folder_btn.grid_remove()
 
-        ttk.Separator(root).grid(row=15, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        ttk.Separator(root).grid(row=16, column=0, columnspan=3, sticky="ew", pady=(16, 0))
 
         # Footer: what's happening on the left, actions on the right. The bar appears only while something runs.
         footer = ttk.Frame(root)
-        footer.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        footer.grid(row=17, column=0, columnspan=3, sticky="ew", pady=(16, 0))
         footer.columnconfigure(0, weight=1)
         self.status_label = ttk.Label(footer, textvariable=self.status_var)
         self.status_label.grid(row=0, column=0, sticky="sw")
@@ -826,21 +845,44 @@ class ReMuxApp(tk.Tk):
         self._show_option_rows()
         self.options_btn.config(text="Hide Options" if self.options_open else "Change…")
         if self.options_open:
-            self.option_rows[0][1].focus_set()
+            self.exportbox.focus_set()
 
     def _show_option_rows(self):
         # While a size is chosen it decides the video codec, so that menu would only be in the way.
         # The hardware switch only appears on computers with video hardware ReMux has checked works.
+        audio_only = self._extracting_audio()
         has_hardware = any(hardware for _, hardware in [*self.video_encoders.values(), *self.size_encoders.values()])
         for widgets in self.option_rows:
-            shown = self.options_open and not (widgets[1] is self.vbox and self._size_encoder()) and not (
-                widgets[1] is self.hardware_check and not has_hardware)
+            box = widgets[1]
+            if audio_only:
+                shown = self.options_open and box in (self.exportbox, self.audio_formatbox)
+            else:
+                shown = self.options_open and box is not self.audio_formatbox and not (
+                    box is self.vbox and self._size_encoder()) and not (
+                    box is self.hardware_check and not has_hardware)
             for widget in widgets:
                 widget.grid() if shown else widget.grid_remove()
         self.target_frame.grid() if self.options_open and self._fitting() else self.target_frame.grid_remove()
 
+    def _extracting_audio(self):
+        return self.output_mode.get() == AUDIO_OUTPUT
+
+    def _on_output_mode_changed(self, *_):
+        audio_only = self._extracting_audio()
+        for widget in (self.audio_label, self.audio_entry, self.audio_btn, self.audio_details_label):
+            widget.grid_remove() if audio_only else widget.grid()
+        self._show_option_rows()
+        if self._fitting():
+            self._suggest_target()
+        self._show_file_details()
+        self._show_output()
+        self._check_fit(adjust=True)
+        self.run_btn.config(text=self._action())
+        self.reveal_btn.grid_remove()
+        self.status_var.set("")
+
     def _fitting(self):
-        return self.size.get() == FIT_SIZE and bool(self._size_encoder())
+        return not self._extracting_audio() and self.size.get() == FIT_SIZE and bool(self._size_encoder())
 
     def _audio_kbps(self):
         """About how many kb/s the new file's sound will take, for fitting a size."""
@@ -951,6 +993,9 @@ class ReMuxApp(tk.Tk):
             self.target_value.set(f"{max(10, round(half / 1e7) * 10):.0f}")
 
     def _summarize(self):
+        if self._extracting_audio():
+            self.output_summary.set(f"Audio only · {self.audio_format.get()}")
+            return
         enc = self._size_encoder()
         video = "original video" if self.vcodec.get() == COPY else f"video as {self.vcodec.get()}"
         if enc:
@@ -986,9 +1031,13 @@ class ReMuxApp(tk.Tk):
             container = "MP4"
         self.container.set(container)
         self.video_path.set(path)
-        if self._fitting():  # the old size was for the old video
+        if self.size.get() == FIT_SIZE and self._size_encoder():  # the old size was for the old video
             self.target_value.set("")
-            self._suggest_target()
+            if self._fitting():
+                self._suggest_target()
+        if self._extracting_audio():
+            self.status_var.set("")
+            return
         if size and container == "MP4" and EXT_TO_CONTAINER.get(ext) != "MP4":
             self.status_var.set(f"Format set to MP4, which can hold the smaller {VIDEO_NAMES[size.family]} video.")
             return
@@ -997,7 +1046,7 @@ class ReMuxApp(tk.Tk):
                             "Format set to MKV, which can hold this video.")
 
     def _pick_audio(self):
-        if self.running:
+        if self.running or self._extracting_audio():
             return
         path = filedialog.askopenfilename(title="Choose an audio track", filetypes=AUDIO_FILETYPES,
                                           initialdir=self._remembered("audio_dir"))
@@ -1049,6 +1098,11 @@ class ReMuxApp(tk.Tk):
         if not paths:
             return
         kind = lambda path: os.path.splitext(path)[1].lstrip(".").lower()
+        if self._extracting_audio():
+            video = next((path for path in paths if kind(path) not in AUDIO_EXTS), None)
+            if video and role != "audio":
+                self._set_video(video)
+            return
         name = os.path.basename(paths[0])
         if role == "video":
             if kind(paths[0]) in AUDIO_EXTS:  # an audio file can't be the video; it was meant for Audio
@@ -1156,8 +1210,9 @@ class ReMuxApp(tk.Tk):
         v, a = self.media.get(video), self.media.get(audio)
 
         if not video:
-            self.video_details.set("The video to put new audio on, or to convert."
-                                   + (" Drop it here, or click to choose." if self.can_drop else ""))
+            hint = ("Choose a video to extract its first audio track." if self._extracting_audio()
+                    else "The video to put new audio on, or to convert.")
+            self.video_details.set(hint + (" Drop it here, or click to choose." if self.can_drop else ""))
         elif v:
             streams = f"{VIDEO_NAMES.get(v.video, v.video.upper())} video" if v.video else "no video"
             streams += f", {self._audio_name(v.audio)} audio" if v.audio else ", no audio"
@@ -1166,6 +1221,9 @@ class ReMuxApp(tk.Tk):
         else:
             self.video_details.set(f"Reading…\nIn {short_folder(video)}")
 
+        if self._extracting_audio():
+            self.remove_btn.grid_remove()
+            return
         if not audio:
             self.audio_details.set("Optional: leave empty to keep the video's own audio.")
             self.remove_btn.grid_remove()
@@ -1195,6 +1253,12 @@ class ReMuxApp(tk.Tk):
         self.note_action = None
         container = self.container.get()
         video = self.media.get(self.video_path.get())
+        if self._extracting_audio():
+            note = ""
+            if video and not video.audio:
+                note = f"No audio track found in {os.path.basename(self.video_path.get())}."
+            self._show_output_note(note, container)
+            return
         if video and not video.video:
             notes.append(f"{os.path.basename(self.video_path.get())} has no video in it. "
                          "Choose a video file, and put this one under Audio if it's the new sound.")
@@ -1255,7 +1319,9 @@ class ReMuxApp(tk.Tk):
                                      "Use MOV to keep the audio lossless.")
                             self.note_action = self.note_action or "MOV"
         notes.append(note)
-        note = "\n\n".join(filter(None, notes))
+        self._show_output_note("\n\n".join(filter(None, notes)), container)
+
+    def _show_output_note(self, note, container):
         self.audio_note.set(note)
         self._summarize()
         if note:
@@ -1282,14 +1348,21 @@ class ReMuxApp(tk.Tk):
         video = self.video_path.get()
         if not video:
             return None
-        ext = CONTAINERS[self.container.get()][0]
+        if self._extracting_audio():
+            suffix, ext = "audio", AUDIO_OUTPUTS[self.audio_format.get()][0]
+        else:
+            suffix, ext = "remux", CONTAINERS[self.container.get()][0]
         stem = os.path.splitext(os.path.basename(video))[0]
-        return os.path.join(self.output_dir or os.path.dirname(video), f"{stem}_remux.{ext}")
+        return os.path.join(self.output_dir or os.path.dirname(video), f"{stem}_{suffix}.{ext}")
 
     def _action(self):
+        if self._extracting_audio():
+            return "Extract Audio"
         return "Replace Audio" if self.audio_path.get() else "Convert"
 
     def _doing(self):
+        if self._extracting_audio():
+            return "Extracting audio"
         return "Replacing the audio" if self.audio_path.get() else "Converting"
 
     def _lock_inputs(self, locked):
@@ -1324,6 +1397,9 @@ class ReMuxApp(tk.Tk):
     def _on_encoders_detected(self, video, audio, sizes):
         self.video_encoders = by_label(video)
         self.audio_encoders = {enc.label: enc for enc in audio}
+        families = {enc.family for enc in audio}
+        formats = [label for label, (_, family) in AUDIO_OUTPUTS.items() if family is None or family in families]
+        self.audio_formatbox.config(values=formats)
         self.size_encoders = by_label(sizes)
         if SMALLER in self.size_encoders:
             self.size_encoders[FIT_SIZE] = self.size_encoders[SMALLER]
@@ -1394,11 +1470,18 @@ class ReMuxApp(tk.Tk):
                 self._offer_ffmpeg_install()
             return
         video, audio = self.video_path.get(), self.audio_path.get()
+        audio_only = self._extracting_audio()
+        if audio_only:
+            audio = ""
         if not video:
             messagebox.showwarning("Choose a video", "Choose the video you want to work on first.")
             return
         known = self.media.get(video)
-        if known and not known.video:
+        if audio_only and known and not known.audio:
+            messagebox.showwarning("No audio in this file", f"{os.path.basename(video)} has no audio track.",
+                                   detail="Choose a video with audio.")
+            return
+        if not audio_only and known and not known.video:
             messagebox.showwarning("No video in this file", f"{os.path.basename(video)} has no video track.",
                                    detail="Choose a video file. If this is the new sound, choose it under Audio.")
             return
@@ -1423,6 +1506,10 @@ class ReMuxApp(tk.Tk):
             output = self._ask_existing(output)
             if not output:
                 return
+        if audio_only and os.path.exists(output) and os.path.samefile(video, output):
+            messagebox.showwarning("Source and output are the same file",
+                                   "Choose a different output folder to keep your source file.")
+            return
         if audio and os.path.exists(output) and os.path.samefile(audio, output):
             messagebox.showwarning("Audio and new file are the same",
                                    f"ReMux would save the new video over your audio file, {os.path.basename(output)}.",
@@ -1443,18 +1530,22 @@ class ReMuxApp(tk.Tk):
         self.started_at = time.monotonic()
         self.job_output, self.tmp_output = output, tmp
         self._set_busy(True, f"{self._doing()}…")
-        venc = self._video_encoder()
-        aenc = self.audio_encoders.get(self.acodec.get())
+        venc = None if audio_only else self._video_encoder()
+        if audio_only:
+            family = AUDIO_OUTPUTS[self.audio_format.get()][1]
+            aenc = next((enc for enc in self.audio_encoders.values() if enc.family == family), None)
+        else:
+            aenc = self.audio_encoders.get(self.acodec.get())
         # Smaller files are only kept if they really are smaller; with new audio, the sizes can't be compared.
         # A size that was asked for is kept: it was already checked against the original.
-        self.job_original = (os.path.getsize(video) if self._size_encoder() and not audio and not fit_kbps
-                             else None)
+        shrinking = not audio_only and self._size_encoder() and not audio and not fit_kbps
+        self.job_original = os.path.getsize(video) if shrinking else None
         self.job_target = fit_kbps and parse_size(self.target_value.get(), self.target_unit.get())
         channels = getattr(self.media.get(audio or video), "channels", None)
         # Lengths were already read when the files were picked; the worker only reads any that are missing.
         known = [getattr(self.media.get(path), "duration", None) for path in (video, audio)]
         threading.Thread(target=self._remux, args=(video, audio, venc, aenc, tmp, channels, fit_kbps, *known),
-                         daemon=True).start()
+                         kwargs={"audio_only": audio_only}, daemon=True).start()
 
     def _ask_existing(self, output):
         """Ask what to do about a file that's already there, with buttons that say what they do.
@@ -1510,27 +1601,30 @@ class ReMuxApp(tk.Tk):
             if self.proc:
                 self.proc.terminate()
 
-    def _build_command(self, video, audio, venc, aenc, output, shortest, channels=None):
+    def _build_command(self, video, audio, venc, aenc, output, shortest, channels=None, *, audio_only=False):
         cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y",
                "-i", video]
-        if audio:
+        if audio_only:
+            cmd += ["-map", "0:a:0"]
+        elif audio:
             cmd += ["-i", audio, "-map", "0:v:0", "-map", "1:a:0"]
         else:
             cmd += ["-map", "0:v:0", "-map", "0:a?"]
-        cmd += ["-c:v", venc.name, *venc.args] if venc else ["-c:v", "copy"]
+        if not audio_only:
+            cmd += ["-c:v", venc.name, *venc.args] if venc else ["-c:v", "copy"]
         cmd += ["-c:a", aenc.name, *aenc.args] if aenc else ["-c:a", "copy"]
         if aenc and channels and channels > 2 and aenc.family in SURROUND_BITRATE:
             cmd += ["-b:a", SURROUND_BITRATE[aenc.family]]  # the later -b:a wins
         if shortest:
             cmd += ["-shortest"]
-        if output.endswith((".mp4", ".mov")):
+        if output.endswith((".mp4", ".mov", ".m4a")):
             cmd += ["-movflags", "+faststart"]
             if venc and venc.family == "hevc":
                 cmd += ["-tag:v", "hvc1"]  # lets Apple players open HEVC
         return cmd + [output]
 
     def _remux(self, video, audio, venc, aenc, tmp, channels=None, fit_kbps=None, duration=None,
-               audio_duration=None):
+               audio_duration=None, *, audio_only=False):
         duration = duration or media_info(self.ffmpeg, video).duration
         doing = self._doing()  # read here, before the worker loop, while it matches the job
         started = self.started_at
@@ -1552,7 +1646,7 @@ class ReMuxApp(tk.Tk):
                                           channels)]
         else:
             venc = fit_encoder(venc, fit_kbps) if fit_kbps else venc
-            passes = [self._build_command(video, audio, venc, aenc, tmp, shortest, channels)]
+            passes = [self._build_command(video, audio, venc, aenc, tmp, shortest, channels, audio_only=audio_only)]
 
         code = None
         with tempfile.TemporaryFile(mode="w+", errors="replace") as log:
@@ -1634,7 +1728,10 @@ class ReMuxApp(tk.Tk):
         if self.cancelled:
             self.status_var.set("Stopped. Nothing was saved.")
             return
-        failed = "Couldn't replace the audio" if self.audio_path.get() else "Couldn't convert the video"
+        if self._extracting_audio():
+            failed = "Couldn't extract the audio"
+        else:
+            failed = "Couldn't replace the audio" if self.audio_path.get() else "Couldn't convert the video"
         self.status_var.set(f"{failed}.")
         self._tell_if_away(failed, os.path.basename(output))
         messagebox.showerror(failed, self._explain(message), detail=tail(message) or f"ffmpeg exited with code {code}.")

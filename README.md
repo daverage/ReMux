@@ -3,12 +3,13 @@
 A small desktop app that puts a new audio track on a video, and optionally converts it to another format or codec. Runs on macOS, Windows and Linux.
 
 - **Replace audio:** pick a video and an audio file (or a video to take audio from). Leave audio empty to keep the original.
+- **Extract audio:** choose a video, then select **Output → Change… → Export → Audio only**. ReMux saves the first audio track as `<name>_audio.<ext>`. MKA keeps the original track without re-encoding. WAV, FLAC, M4A (AAC) and MP3 are also available when FFmpeg supports their encoders.
 - **Convert:** MP4, MOV, MKV, WebM, AVI or MPEG-TS, with stream copy (fast, lossless) or re-encoding to H.264, HEVC, AV1, VP9, ProRes, AAC, MP3, Opus, FLAC, ALAC, PCM or AC-3.
 - **Make it smaller:** re-encode the video with a more efficient codec to save disk space. See [Making files smaller](#making-files-smaller).
 - **Hardware encoding:** tick *Use graphics hardware* to encode on Apple's media engine, an NVIDIA or AMD graphics card, or Intel Quick Sync. It works for every codec and size that this computer's hardware supports, and only appears once ReMux has checked that the hardware works.
 - **Show the result:** when it finishes, one click opens the output in Finder / Explorer / your file manager.
 
-The output is saved next to the video as `<name>_remux.<ext>`, or in a folder you choose. If that file already exists, ReMux asks whether to replace it or keep both (saving `<name>_remux 2.<ext>`).
+ReMux saves output next to the video, or in a folder you choose. Video exports use `<name>_remux.<ext>`. If the output file already exists, ReMux asks whether to replace it or keep both.
 
 ## Making files smaller
 
